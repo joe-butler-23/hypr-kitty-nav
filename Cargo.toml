@@ -1,0 +1,9 @@
+[package]
+name = "hypr-kitty-nav"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Smart navigation between Kitty panes and Hyprland windows"
+repository = "https://github.com/joe-butler-23/hypr-kitty-nav"
+
+[dependencies]
