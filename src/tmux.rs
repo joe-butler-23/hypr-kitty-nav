@@ -1,9 +1,13 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+/// Known terminal emulator window classes
+const KNOWN_TERMINALS: &[&str] = &["kitty"];
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -20,24 +24,24 @@ fn main() {
         _ => std::process::exit(2),
     };
 
-    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    let sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default();
-    if sig.is_empty() {
-        std::process::exit(1);
-    }
+    let hypr_socket = match find_hyprland_socket() {
+        Some(path) => path,
+        None => std::process::exit(1),
+    };
 
-    let hypr_socket = PathBuf::from(&xdg)
-        .join("hypr")
-        .join(&sig)
-        .join(".socket.sock");
-
-    // Check if active window is running tmux
-    if let Some(pid) = get_active_window_pid(&hypr_socket) {
-        if is_running_tmux(pid) {
-            // Try to find the tmux session for this terminal
-            if let Some(session) = find_tmux_session_for_pid(pid) {
-                if try_tmux_navigate_session(&session, tmux_dir) {
-                    return;
+    // Get active window info (class + PID) in single query
+    if let Some((class, pid)) = get_active_window_info(&hypr_socket) {
+        // Fast path: skip non-terminal windows entirely
+        if is_terminal_class(&class) {
+            // Combined detection: find TTY and check for tmux in one tree walk
+            if let Some((tty, has_tmux)) = detect_tmux_and_tty(pid) {
+                if has_tmux {
+                    // Try to find session and navigate
+                    if let Some(session) = find_tmux_session(&tty) {
+                        if try_tmux_navigate(&session, tmux_dir) {
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -47,7 +51,52 @@ fn main() {
     hypr_dispatch(&hypr_socket, move_dir);
 }
 
-fn get_active_window_pid(socket_path: &PathBuf) -> Option<u32> {
+/// Check if the window class represents a terminal emulator
+fn is_terminal_class(class: &str) -> bool {
+    // First, check $TERMINAL environment variable
+    if let Ok(terminal) = env::var("TERMINAL") {
+        // Extract binary name from path (e.g., /usr/bin/kitty -> kitty)
+        let terminal_name = terminal
+            .rsplit('/')
+            .next()
+            .unwrap_or(&terminal)
+            .to_lowercase();
+        if class.to_lowercase().contains(&terminal_name) {
+            return true;
+        }
+    }
+
+    // Fall back to known terminal list
+    let class_lower = class.to_lowercase();
+    KNOWN_TERMINALS
+        .iter()
+        .any(|t| class_lower.contains(&t.to_lowercase()))
+}
+
+/// Find the Hyprland socket path
+fn find_hyprland_socket() -> Option<PathBuf> {
+    let xdg = env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let sig = env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+
+    if sig.is_empty() {
+        return None;
+    }
+
+    let hypr_dir = PathBuf::from(&xdg).join("hypr").join(&sig);
+    let socket_names = [".socket.sock", ".socket2.sock", "socket.sock"];
+
+    for name in &socket_names {
+        let path = hypr_dir.join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    Some(hypr_dir.join(".socket.sock"))
+}
+
+/// Get active window class and PID in a single Hyprland query
+fn get_active_window_info(socket_path: &PathBuf) -> Option<(String, u32)> {
     let mut stream = UnixStream::connect(socket_path).ok()?;
     stream.write_all(b"activewindow").ok()?;
     stream.shutdown(std::net::Shutdown::Write).ok()?;
@@ -55,71 +104,88 @@ fn get_active_window_pid(socket_path: &PathBuf) -> Option<u32> {
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
 
-    response
-        .lines()
-        .find(|l| l.trim().starts_with("pid: "))
-        .and_then(|l| l.trim().strip_prefix("pid: "))
-        .and_then(|s| s.trim().parse::<u32>().ok())
+    let mut class = None;
+    let mut pid = None;
+
+    for line in response.lines() {
+        let trimmed = line.trim();
+        if let Some(c) = trimmed.strip_prefix("class: ") {
+            class = Some(c.trim().to_string());
+        } else if let Some(p) = trimmed.strip_prefix("pid: ") {
+            pid = p.trim().parse::<u32>().ok();
+        }
+        // Early exit if we have both
+        if class.is_some() && pid.is_some() {
+            break;
+        }
+    }
+
+    match (class, pid) {
+        (Some(c), Some(p)) => Some((c, p)),
+        _ => None,
+    }
 }
 
-fn is_running_tmux(pid: u32) -> bool {
-    let mut pids_to_check = vec![pid];
-    let mut checked = std::collections::HashSet::new();
+/// Combined detection: find TTY and check for tmux in process tree
+/// Returns (tty_path, has_tmux)
+fn detect_tmux_and_tty(pid: u32) -> Option<(String, bool)> {
+    let mut tty: Option<String> = None;
+    let mut has_tmux = false;
 
-    while let Some(current_pid) = pids_to_check.pop() {
-        if checked.contains(&current_pid) {
+    // BFS through process tree (downward) to find both TTY and tmux
+    const MAX_DEPTH: usize = 10;
+    let mut to_check: Vec<(u32, usize)> = vec![(pid, 0)];
+    let mut checked: HashSet<u32> = HashSet::new();
+
+    while let Some((current_pid, depth)) = to_check.pop() {
+        if checked.contains(&current_pid) || depth > MAX_DEPTH {
             continue;
         }
         checked.insert(current_pid);
 
-        if let Ok(cmdline) = fs::read_to_string(format!("/proc/{}/cmdline", current_pid)) {
-            let cmd = cmdline.replace('\0', " ");
-            if cmd.contains("tmux") && !cmd.contains("hypr-tmux-nav") {
-                return true;
+        // Check for TTY on this process
+        if tty.is_none() {
+            if let Ok(link) = fs::read_link(format!("/proc/{}/fd/0", current_pid)) {
+                if let Some(tty_str) = link.to_str() {
+                    if tty_str.starts_with("/dev/pts/") {
+                        tty = Some(tty_str.to_string());
+                    }
+                }
             }
         }
 
-        if let Ok(entries) = fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                if let Ok(metadata) = entry.metadata() {
-                    if !metadata.is_dir() {
-                        continue;
-                    }
+        // Check if this process is tmux
+        if !has_tmux {
+            if let Ok(cmdline) = fs::read_to_string(format!("/proc/{}/cmdline", current_pid)) {
+                let cmd = cmdline.replace('\0', " ");
+                if cmd.contains("tmux") && !cmd.contains("hypr-tmux-nav") {
+                    has_tmux = true;
                 }
+            }
+        }
 
-                if let Some(name) = entry.file_name().to_str() {
-                    if let Ok(child_pid) = name.parse::<u32>() {
-                        if let Ok(status) =
-                            fs::read_to_string(format!("/proc/{}/status", child_pid))
-                        {
-                            for line in status.lines() {
-                                if line.starts_with("PPid:") {
-                                    if let Some(ppid_str) = line.strip_prefix("PPid:") {
-                                        if let Ok(ppid) = ppid_str.trim().parse::<u32>() {
-                                            if ppid == current_pid {
-                                                pids_to_check.push(child_pid);
-                                            }
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
+        // Early exit if we found both
+        if tty.is_some() && has_tmux {
+            break;
+        }
+
+        // Get children - try fast path first
+        let children_path = format!("/proc/{}/task/{}/children", current_pid, current_pid);
+        if let Ok(children) = fs::read_to_string(&children_path) {
+            for child_str in children.split_whitespace() {
+                if let Ok(child_pid) = child_str.parse::<u32>() {
+                    to_check.push((child_pid, depth + 1));
                 }
             }
         }
     }
 
-    false
+    tty.map(|t| (t, has_tmux))
 }
 
-fn find_tmux_session_for_pid(pid: u32) -> Option<String> {
-    // Get the TTY of the active window's process
-    let tty = fs::read_link(format!("/proc/{}/fd/0", pid)).ok()?;
-    let tty_str = tty.to_str()?;
-
-    // Get all tmux clients and find one using this TTY
+/// Find the tmux session for a given TTY
+fn find_tmux_session(tty: &str) -> Option<String> {
+    // Single tmux call to get all client info
     let output = Command::new("tmux")
         .args(&["list-clients", "-F", "#{client_session} #{client_tty}"])
         .stdout(Stdio::piped())
@@ -132,68 +198,63 @@ fn find_tmux_session_for_pid(pid: u32) -> Option<String> {
     }
 
     let clients = String::from_utf8_lossy(&output.stdout);
+    let mut sessions: Vec<&str> = Vec::new();
+
     for line in clients.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
             let session = parts[0];
             let client_tty = parts[1];
-            if tty_str.ends_with(client_tty) || client_tty.ends_with(tty_str) {
+
+            // Exact TTY match
+            if tty == client_tty {
                 return Some(session.to_string());
             }
+            sessions.push(session);
         }
     }
 
-    // Fallback: return most recently attached session
-    let output = Command::new("tmux")
-        .args(&[
-            "list-sessions",
-            "-F",
-            "#{session_name} #{session_last_attached}",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let mut sessions: Vec<(String, u64)> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 1 {
-                    let name = parts[0].to_string();
-                    let time = parts
-                        .get(1)
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(0);
-                    Some((name, time))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        sessions.sort_by(|a, b| b.1.cmp(&a.1));
-        return sessions.first().map(|(name, _)| name.clone());
+    // If only one session exists, use it (common case)
+    if sessions.len() == 1 {
+        return Some(sessions[0].to_string());
     }
 
     None
 }
 
-fn try_tmux_navigate_session(session: &str, direction: &str) -> bool {
-    let before = get_tmux_pane(session);
-
-    let status = Command::new("tmux")
-        .args(&["select-pane", "-t", session, &format!("-{}", direction)])
-        .stdout(Stdio::null())
+/// Try to navigate within tmux, returns true if pane changed
+fn try_tmux_navigate(session: &str, direction: &str) -> bool {
+    // Combined command: get pane ID, select pane, get pane ID again
+    // Output will be two lines: before_id and after_id
+    let output = Command::new("tmux")
+        .args(&[
+            "display-message",
+            "-t",
+            session,
+            "-p",
+            "#{pane_id}",
+            ";",
+            "select-pane",
+            "-t",
+            session,
+            &format!("-{}", direction),
+            ";",
+            "display-message",
+            "-t",
+            session,
+            "-p",
+            "#{pane_id}",
+        ])
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .status();
+        .output();
 
-    if let Ok(s) = status {
-        if s.success() {
-            let after = get_tmux_pane(session);
-            if before != after {
-                return true;
+    if let Ok(out) = output {
+        if out.status.success() {
+            let result = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<&str> = result.lines().collect();
+            if lines.len() >= 2 {
+                return lines[0] != lines[1];
             }
         }
     }
@@ -201,24 +262,10 @@ fn try_tmux_navigate_session(session: &str, direction: &str) -> bool {
     false
 }
 
-fn get_tmux_pane(session: &str) -> Option<String> {
-    let output = Command::new("tmux")
-        .args(&["display-message", "-t", session, "-p", "#{pane_id}"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
-}
-
 fn hypr_dispatch(socket_path: &PathBuf, dir: &str) {
     if let Ok(mut stream) = UnixStream::connect(socket_path) {
         let cmd = format!("dispatch movefocus {}", dir);
         let _ = stream.write_all(cmd.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 }
