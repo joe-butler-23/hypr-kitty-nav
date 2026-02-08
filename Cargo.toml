@@ -6,6 +6,10 @@ license = "MIT"
 description = "Smart navigation between Kitty panes and Hyprland windows"
 repository = "https://github.com/joe-butler-23/hypr-kitty-nav"
 
+[lib]
+name = "hypr_nav_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "hypr-kitty-nav"
 path = "src/main.rs"
@@ -13,5 +17,9 @@ path = "src/main.rs"
 [[bin]]
 name = "hypr-tmux-nav"
 path = "src/tmux.rs"
+
+[[bin]]
+name = "hypr-smart-close"
+path = "src/close.rs"
 
 [dependencies]

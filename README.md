@@ -1,78 +1,87 @@
-# hypr-kitty-nav
+# hypr-nav-suite
 
-Smart directional navigation between Kitty and Hyprland. Lets you use the same keybinds to navigate between windows inside a single instance of Kitty as you use to navigate between windows in Hyprland. 
+A hackable suite of Rust tools for smart, context-aware interaction between Hyprland, Kitty, and Tmux.
 
-- Reads the active window from the Hyprland socket
-- If the active window is Kitty, focuses the neighboring Kitty window (sub-window? pane?)
-- Otherwise, moves Hyprland focus in the same direction
+This project enables **Seamless Context Switching**: use the same keybinds (like `Super+H/J/K/L` or `Super+C`) to interact with the active application's internal state (Tmux panes, Kitty windows) or fall back to the window manager (Hyprland) when appropriate.
 
-This started life as a very clunky and laggy script that used different jq calls, which turned into a slightly better bash version. And then Codex (yes, the code is AI-generated) came up with this version in rust using IPC sockets which has basically zero latency.
+It is designed to be **extensible**. The core logic is extracted into a shared library, making it easy to build your own "Smart Binds" that inspect the current window/process state before deciding on an action.
 
-## Binaries
+## Tools
 
-This package provides two binaries:
+### 1. hypr-tmux-nav
+Seamless navigation between Tmux panes and Hyprland windows.
 
-- **hypr-kitty-nav** - Navigation between Kitty panes and Hyprland windows
-- **hypr-tmux-nav** - Navigation between tmux panes and Hyprland windows
+- **Smart Directional Awareness**: Checks if you are at the edge of a Tmux window.
+- **Auto-Fallback**: If you try to move `UP` from the top Tmux pane, it automatically focuses the Hyprland window above your terminal.
+- **Process Tree Detection**: Automatically detects if the active terminal is running Tmux (even via SSH or nested shells).
 
-## Requirements
+### 2. hypr-smart-close
+Context-aware closing logic for `Super+C`.
 
-Obviously Hyprland and cargo to install if you want to build from source.
+- **Named Sessions**: If inside a named Tmux session, `Super+C` **detaches** the client instead of killing it.
+- **Panes**: If inside a generic session with multiple panes, `Super+C` closes the active **pane**.
+- **Windows**: If it's the last pane of the last window, or not in Tmux, `Super+C` closes the **Hyprland window**.
 
-### For hypr-kitty-nav (Kitty)
+### 3. hypr-kitty-nav
+Original tool for navigating between native Kitty windows (splits) and Hyprland.
+*Note: Requires Kitty remote control enabled.*
 
-Because this uses Kitty's remote control functionality, you need the following in your Kitty config:
+## Architecture & Hacking
 
+The core logic is modularized in `src/lib.rs`. You can easily create your own binary to handle other keys (e.g., `Super+Enter` to spawn a pane vs window).
+
+**General Pattern:**
+1. **Identify Context**: Get active Hyprland window info (class, PID).
+2. **Deep Inspection**: Traverse process tree to find target apps (Tmux, Neovim, etc.).
+3. **Query State**: Use app-specific IPC (Tmux CLI, Kitty socket) to check state (e.g., `is_pane_at_edge`).
+4. **Action or Fallback**: Perform internal app action or dispatch Hyprland dispatcher.
+
+### Example: Custom Action
+Want a key that maximizes a Tmux pane if active, or toggles fullscreen in Hyprland otherwise?
+
+```rust
+// src/my-custom-bind.rs
+use hypr_nav_lib::*;
+
+fn main() {
+    let socket = find_hyprland_socket().unwrap();
+    if let Some((_, pid)) = get_active_window_info(&socket) {
+        if let Some((tty, true)) = detect_tmux_and_tty(pid) {
+             // Run tmux zoom
+             return;
+        }
+    }
+    // Fallback
+    hypr_dispatch(&socket, "fullscreen 0");
+}
 ```
-allow_remote_control socket-only
-listen_on unix:/run/user/1000/kitty
-```
 
-And then you set your Hyprland binds like this:
+## Installation
 
-```ini
-bind = SUPER, H, exec, hypr-kitty-nav left
-bind = SUPER, J, exec, hypr-kitty-nav down
-bind = SUPER, K, exec, hypr-kitty-nav up
-bind = SUPER, L, exec, hypr-kitty-nav right
-```
-
-### For hypr-tmux-nav (tmux)
-
-No special tmux configuration is required - the binary uses tmux's standard command interface.
-
-Set your Hyprland binds like this:
-
-```ini
-bind = SUPER, H, exec, hypr-tmux-nav left
-bind = SUPER, J, exec, hypr-tmux-nav down
-bind = SUPER, K, exec, hypr-tmux-nav up
-bind = SUPER, L, exec, hypr-tmux-nav right
-```
-
-**How it works:**
-1. Checks if the active Hyprland window is running tmux
-2. If so, attempts to navigate to the neighboring tmux pane
-3. If navigation within tmux doesn't change panes (i.e., at the edge), falls back to Hyprland window navigation
-
-This gives you seamless vim-style navigation that automatically "escapes" from tmux when you're at the edge of your pane layout.
-
-**Terminal detection:** The tool uses the `$TERMINAL` environment variable to identify terminal windows. If not set, it falls back to a hardcoded list (currently just `kitty`). Non-terminal windows skip tmux detection entirely for faster response.
-
-## Build and install
-
-If you don't want to install anything, it would be pretty trivial to rewrite `src/main.rs` as a script that you could then call directly from your Hyprland.conf. Otherwise:
-
+### From Source
 ```bash
 git clone https://github.com/joe-butler-23/hypr-kitty-nav
 cd hypr-kitty-nav
 cargo build --release
-install -Dm755 target/release/hypr-kitty-nav ~/.local/bin/hypr-kitty-nav
-install -Dm755 target/release/hypr-tmux-nav ~/.local/bin/hypr-tmux-nav
+cp target/release/hypr-tmux-nav ~/.local/bin/
+cp target/release/hypr-smart-close ~/.local/bin/
 ```
 
-Or:
+### Configuration (Hyprland)
 
-```bash
-cargo install --git https://github.com/joe-butler-23/hypr-kitty-nav
+```ini
+# Navigation
+bind = SUPER, h, exec, hypr-tmux-nav left
+bind = SUPER, j, exec, hypr-tmux-nav down
+bind = SUPER, k, exec, hypr-tmux-nav up
+bind = SUPER, l, exec, hypr-tmux-nav right
+
+# Smart Close
+bind = SUPER, c, exec, hypr-smart-close
 ```
+
+## Requirements
+- Rust (cargo)
+- Hyprland
+- Tmux (for tmux tools)
+- Kitty (for kitty tools)
